@@ -26,6 +26,15 @@ async function call(key: string, path: string, init?: RequestInit) {
   return body;
 }
 
+// The API lists every model that can generate content; the picker offers only Gemini 3 and later, Flash and Pro.
+export function isChatModel(name: string) {
+  return (
+    /^models\/gemini-([3-9]|\d\d)(\.\d+)?-(flash|pro)/.test(name) &&
+    !/tts|image|audio|live|embedding|robotics|computer-use|deep-research|customtools/.test(name) && // other jobs than chat
+    !/-\d{3}$|-\d{2}-\d{2,4}$|-exp|-latest$/.test(name) // pinned, dated and alias duplicates of a listed model
+  );
+}
+
 export async function listModels(key: string): Promise<Model[]> {
   const models: Model[] = [];
   let pageToken = "";
@@ -34,7 +43,7 @@ export async function listModels(key: string): Promise<Model[]> {
     models.push(...(body?.models ?? []));
     pageToken = body?.nextPageToken ?? "";
   } while (pageToken);
-  return models.filter((m) => m.supportedGenerationMethods?.includes("generateContent"));
+  return models.filter((m) => m.supportedGenerationMethods?.includes("generateContent") && isChatModel(m.name));
 }
 
 export function toContents(messages: Message[]) {
@@ -62,6 +71,21 @@ if (import.meta.env.DEV) {
     { role: "model", parts: [{ text: "yo" }] },
   ];
   console.assert(JSON.stringify(got) === JSON.stringify(want), "toContents self-check failed", got);
+  const kept = [
+    "gemini-3-pro-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-10-flash",
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-3-pro-image-preview",
+    "gemini-3-flash-preview-12-2025",
+    "gemini-3.1-pro-preview-customtools",
+    "gemini-3.5-flash-preview-tts",
+    "gemini-flash-latest",
+    "gemini-robotics-er-3-preview",
+    "gemma-3-27b-it",
+  ].filter((n) => isChatModel(`models/${n}`));
+  console.assert(kept.join() === "gemini-3-pro-preview,gemini-3.1-flash-lite,gemini-10-flash", "isChatModel self-check failed", kept);
 }
 
 export async function generate(key: string, model: string, messages: Message[], effort: Effort): Promise<string> {
