@@ -84,13 +84,14 @@ Subscriptions accept image attachments only (PNG, JPEG, GIF, WebP). Each message
 
 - **Shortcut to show and hide** – click it, then press the new combination. It needs Ctrl, Alt/Option or Cmd/Win in it.
 - **Clear chat when away for** – starts a fresh chat when you come back after the chosen time. Off by default.
+- **Double-tap Command to attach a screenshot** (Ctrl on Windows and Linux) – press the key twice quickly, from any app: Astral captures the display the pointer is on, opens, and attaches the picture. macOS asks for Screen Recording permission the first time. On Linux it works under X11, not Wayland.
 - **Default model** – the model a new chat starts with.
 - **Effort** – how hard the model thinks before answering. "Provider default" sends nothing; if a model rejects a level, set it back to that.
 - **AI connection** – switch provider or replace a key. The current connection stays until the new one checks out.
 
 ## Development
 
-You need [Node.js](https://nodejs.org/), [Rust](https://rustup.rs/) and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your platform.
+You need [Node.js](https://nodejs.org/), [Rust](https://rustup.rs/) and the [Tauri prerequisites](https://tauri.app/start/prerequisites/) for your platform. On Linux the screenshot feature also needs `libx11-dev libxcb1-dev libxrandr-dev libpipewire-0.3-dev libdbus-1-dev libclang-dev` (Debian/Ubuntu names).
 
 ```sh
 npm install

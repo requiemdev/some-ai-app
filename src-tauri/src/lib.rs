@@ -308,6 +308,200 @@ fn cli_ask(
     result
 }
 
+// Two presses of the tap key alone (Command on macOS, Control elsewhere) in quick succession,
+// with nothing else pressed since the first one (so Cmd+C then Cmd+V does not count).
+#[derive(Default)]
+struct DoubleTap {
+    down: bool,
+    first: Option<std::time::Instant>,
+}
+
+impl DoubleTap {
+    const WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+    // `tap`: the tap key is held; `other`: any other key, modifier or mouse button is in play.
+    fn step(&mut self, tap: bool, other: bool, now: std::time::Instant) -> bool {
+        let pressed = tap && !other && !self.down;
+        self.down = tap;
+        if other {
+            self.first = None;
+        }
+        if !pressed {
+            return false;
+        }
+        match self.first.take() {
+            Some(first) if now - first < Self::WINDOW => true,
+            _ => {
+                self.first = Some(now);
+                false
+            }
+        }
+    }
+}
+
+// shortcut: the keyboard is polled, which needs no Accessibility permission or input hook; a tap shorter than the poll is missed, move to an event tap if that shows
+const POLL: std::time::Duration = std::time::Duration::from_millis(15);
+
+// (the tap key is held, something else is in play), read from the OS-wide key state.
+#[cfg(target_os = "macos")]
+fn keys() -> (bool, bool) {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceFlagsState(state: i32) -> u64;
+        fn CGEventSourceSecondsSinceLastEventType(state: i32, event: u32) -> f64;
+    }
+    const SESSION: i32 = 0; // kCGEventSourceStateCombinedSessionState
+    const LEFT_MOUSE_DOWN: u32 = 1;
+    const KEY_DOWN: u32 = 10;
+    const CMD: u64 = 0x10_0000;
+    const MODIFIERS: u64 = 0x1E_0000; // shift, control, option, command
+    let (mods, idle) = unsafe {
+        (
+            CGEventSourceFlagsState(SESSION) & MODIFIERS,
+            CGEventSourceSecondsSinceLastEventType(SESSION, KEY_DOWN)
+                .min(CGEventSourceSecondsSinceLastEventType(SESSION, LEFT_MOUSE_DOWN)),
+        )
+    };
+    // a press within the last two polls is seen by at least one of them
+    (mods & CMD != 0, mods != CMD && mods != 0 || idle < 2.0 * POLL.as_secs_f64())
+}
+
+#[cfg(windows)]
+fn keys() -> (bool, bool) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetAsyncKeyState(key: i32) -> i16;
+    }
+    let down = |key: i32| unsafe { GetAsyncKeyState(key) } < 0;
+    const CONTROL: [i32; 3] = [0x11, 0xA2, 0xA3]; // either, left, right
+    // virtual keys 1 to 6 are the mouse buttons
+    (down(CONTROL[0]), (1..0xFF).any(|key| !CONTROL.contains(&key) && down(key)))
+}
+
+// shortcut: X11 only, a Wayland compositor shows no app the keys pressed in another one; needs a desktop portal for global shortcuts when Wayland matters
+#[cfg(target_os = "linux")]
+fn keys() -> (bool, bool) {
+    use std::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XOpenDisplay(name: *const c_char) -> *mut c_void;
+        fn XDefaultRootWindow(display: *mut c_void) -> c_ulong;
+        fn XKeysymToKeycode(display: *mut c_void, keysym: c_ulong) -> u8;
+        fn XQueryKeymap(display: *mut c_void, keys: *mut c_char) -> c_int;
+        fn XQueryPointer(
+            display: *mut c_void,
+            window: c_ulong,
+            root: *mut c_ulong,
+            child: *mut c_ulong,
+            root_x: *mut c_int,
+            root_y: *mut c_int,
+            x: *mut c_int,
+            y: *mut c_int,
+            mask: *mut c_uint,
+        ) -> c_int;
+    }
+    // one connection, used by the watcher thread only; 0 when there is no X server
+    static DISPLAY: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let display = *DISPLAY.get_or_init(|| unsafe { XOpenDisplay(std::ptr::null()) } as usize) as *mut c_void;
+    if display.is_null() {
+        return (false, false);
+    }
+    let mut down = [0 as c_char; 32]; // one bit per keycode
+    let (mut window, mut position, mut mask) = (0, 0, 0);
+    let control = unsafe {
+        XQueryKeymap(display, down.as_mut_ptr());
+        XQueryPointer(
+            display,
+            XDefaultRootWindow(display),
+            &mut window,
+            &mut window,
+            &mut position,
+            &mut position,
+            &mut position,
+            &mut position,
+            &mut mask,
+        );
+        [XKeysymToKeycode(display, 0xFFE3), XKeysymToKeycode(display, 0xFFE4)] // Control_L, Control_R
+    };
+    let (mut tap, mut other) = (false, mask & 0x1F00 != 0); // the five mouse buttons
+    for code in 0..=255u8 {
+        if down[code as usize / 8] as u8 & (1 << (code % 8)) != 0 {
+            if control.contains(&code) {
+                tap = true;
+            } else {
+                other = true;
+            }
+        }
+    }
+    (tap, other)
+}
+
+// The display under the pointer; the primary one when the pointer cannot be placed.
+fn capture(pointer: Option<(i32, i32)>) -> Result<Vec<u8>, String> {
+    let monitor = match pointer.and_then(|(x, y)| xcap::Monitor::from_point(x, y).ok()) {
+        Some(monitor) => monitor,
+        None => xcap::Monitor::all()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|m| m.is_primary().unwrap_or(false))
+            .ok_or("no primary display")?,
+    };
+    let shot = monitor.capture_image().map_err(|e| e.to_string())?;
+    // JPEG: a full-resolution PNG runs past the providers' per-image size limits
+    let mut jpeg = Vec::new();
+    image::DynamicImage::ImageRgba8(shot)
+        .into_rgb8()
+        .write_to(&mut std::io::Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+        .map_err(|e| e.to_string())?;
+    Ok(jpeg)
+}
+
+// Captures the screen before the window shows, so the chat is not in its own screenshot.
+fn screenshot(app: &tauri::AppHandle) -> Result<(), String> {
+    use base64::Engine;
+    // Tauri reports the pointer in pixels at the primary display's scale; xcap takes pixels on Windows, points elsewhere.
+    let scale = match app.primary_monitor() {
+        Ok(Some(primary)) if !cfg!(windows) => primary.scale_factor(),
+        _ => 1.0,
+    };
+    let pointer = app.cursor_position().ok().map(|p| ((p.x / scale) as i32, (p.y / scale) as i32));
+    let data = base64::engine::general_purpose::STANDARD.encode(capture(pointer)?);
+    let handle = app.clone();
+    // the macOS panel is AppKit: main thread only
+    app.run_on_main_thread(move || {
+        if let Err(e) = show(&handle).and_then(|_| handle.emit("screenshot", data)) {
+            eprintln!("show screenshot failed: {e}");
+        }
+    })
+    .map_err(|e| e.to_string())
+}
+
+// The double-tap setting; on until the webview says otherwise.
+static DOUBLE_TAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[tauri::command]
+fn set_double_tap(enabled: bool) {
+    DOUBLE_TAP.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn watch_double_tap(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut tap = DoubleTap::default();
+        loop {
+            std::thread::sleep(POLL);
+            let (key, other) = keys();
+            if tap.step(key, other, std::time::Instant::now())
+                && DOUBLE_TAP.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                if let Err(e) = screenshot(&app) {
+                    eprintln!("screenshot failed: {e}");
+                    let _ = app.emit("screenshot-failed", e);
+                }
+            }
+        }
+    });
+}
+
 // The shortcut that toggles the window; the setting in the webview replaces the default one.
 struct ToggleShortcut(std::sync::Mutex<Shortcut>);
 
@@ -370,6 +564,52 @@ mod tests {
     }
 
     #[test]
+    fn double_tap_needs_two_clean_quick_presses() {
+        use std::time::{Duration, Instant};
+        let ms = Duration::from_millis;
+        let t = Instant::now();
+        // press, release, press
+        let mut tap = DoubleTap::default();
+        assert!(!tap.step(true, false, t));
+        assert!(!tap.step(false, false, t + ms(80)));
+        assert!(tap.step(true, false, t + ms(200)));
+        // consumed: a third press starts over
+        assert!(!tap.step(false, false, t + ms(260)));
+        assert!(!tap.step(true, false, t + ms(320)));
+        // too slow
+        let mut tap = DoubleTap::default();
+        assert!(!tap.step(true, false, t));
+        assert!(!tap.step(false, false, t + ms(80)));
+        assert!(!tap.step(true, false, t + ms(500)));
+        // a key went down while it was held (Cmd+C, Cmd+V)
+        let mut tap = DoubleTap::default();
+        assert!(!tap.step(true, false, t));
+        assert!(!tap.step(true, true, t + ms(40)));
+        assert!(!tap.step(false, false, t + ms(80)));
+        assert!(!tap.step(true, false, t + ms(200)));
+        // something else in between, or already held at the second press
+        let mut tap = DoubleTap::default();
+        assert!(!tap.step(true, false, t));
+        assert!(!tap.step(false, true, t + ms(80)));
+        assert!(!tap.step(true, false, t + ms(200)));
+        let mut tap = DoubleTap::default();
+        assert!(!tap.step(true, false, t));
+        assert!(!tap.step(false, false, t + ms(80)));
+        assert!(!tap.step(true, true, t + ms(200)));
+    }
+
+    // Needs Screen Recording permission on macOS: cargo test -- --ignored capture
+    #[test]
+    #[ignore]
+    fn capture_returns_a_jpeg() {
+        // by a point on the primary display, and by the fallback when the point is on none
+        for pointer in [Some((10, 10)), Some((-999_999, -999_999)), None] {
+            let jpeg = capture(pointer).unwrap();
+            assert!(jpeg.starts_with(&[0xFF, 0xD8]) && jpeg.len() > 10_000, "{} bytes", jpeg.len());
+        }
+    }
+
+    #[test]
     fn claude_answer_reads_the_result_line() {
         let stream =
             "{\"type\":\"assistant\"}\n{\"type\":\"result\",\"is_error\":false,\"result\":\"Red\"}";
@@ -406,7 +646,7 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![cli_status, cli_ask, codex_models, set_shortcut, resize])
+        .invoke_handler(tauri::generate_handler![cli_status, cli_ask, codex_models, set_shortcut, set_double_tap, resize])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -459,6 +699,7 @@ pub fn run() {
                 eprintln!("could not register Ctrl+Shift+A (held by another app?): {e}");
             }
             app.manage(ToggleShortcut(std::sync::Mutex::new(shortcut)));
+            watch_double_tap(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())
