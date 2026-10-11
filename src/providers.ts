@@ -1,6 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { invoke } from "@tauri-apps/api/core";
 import * as gemini from "./gemini";
+import { SYSTEM } from "./gemini";
 import type { Effort, Message, Model } from "./gemini";
 
 export type Provider = {
@@ -109,7 +110,8 @@ function cli(name: "claude" | "codex", label: string, models: () => Promise<Mode
         cli: name,
         model,
         effort,
-        prompt: toTranscript(messages),
+        // shortcut: the CLIs keep their own system prompt, so ours leads the prompt; move to their system-prompt flags if they ignore it
+        prompt: `${SYSTEM}\n\n${toTranscript(messages)}`,
         images: turns(messages).flatMap((m) => m.attachments ?? []),
       }),
   };
@@ -150,6 +152,7 @@ export const providers: Record<string, Provider> = {
       const res = await claude(key).messages.create({
         model,
         max_tokens: 16000,
+        system: SYSTEM,
         messages: toClaudeMessages(messages),
         ...(effort && { output_config: { effort } }),
       });
@@ -172,6 +175,7 @@ export const providers: Record<string, Provider> = {
     async generate(key, model, messages, effort) {
       const body = await openai(key, "responses", {
         model,
+        instructions: SYSTEM,
         input: toOpenAIInput(messages),
         ...(effort && { reasoning: { effort } }),
       });

@@ -1,5 +1,7 @@
 const BASE = "https://generativelanguage.googleapis.com/v1beta";
 
+export const SYSTEM = "You are Astral, a quick AI assistant.";
+
 export type Attachment = { name: string; mimeType: string; data: string };
 export type Message = {
   role: "user" | "model" | "error";
@@ -93,6 +95,7 @@ export async function generate(key: string, model: string, messages: Message[], 
   const body = await call(key, `${model}:generateContent`, {
     method: "POST",
     body: JSON.stringify({
+      system_instruction: { parts: [{ text: SYSTEM }] },
       contents: toContents(messages),
       ...(effort && { generationConfig: { thinkingConfig: { thinkingLevel: effort } } }),
     }),
