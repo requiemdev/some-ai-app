@@ -7,6 +7,8 @@ export type Provider = {
   label: string;
   // API-key providers only; subscription providers reuse the login of the user's installed CLI
   keyHint?: string;
+  // file types the attach picker offers; unset means any
+  accept?: string;
   listModels(key: string): Promise<Model[]>;
   generate(key: string, model: string, messages: Message[]): Promise<string>;
 };
@@ -74,32 +76,56 @@ export function toClaudeMessages(messages: Message[]): Anthropic.MessageParam[] 
 
 // ---------- subscriptions, through the user's own CLI login ----------
 
-// shortcut: the CLIs get the chat as one flattened prompt and no attachments, switch to their session resume / image flags when that matters
+// shortcut: the CLIs get the chat as one flattened prompt with every image of the chat attached to it, switch to their session resume when long chats matter
 export function toTranscript(messages: Message[]) {
   const list = turns(messages);
-  if (list.length === 1) return list[0].text;
+  // the marker ties each image to its turn, and keeps an image-only prompt from being empty
+  const said = (m: Message) =>
+    [m.text, ...(m.attachments ?? []).map((a) => `[attached image: ${a.name}]`)].filter(Boolean).join("\n");
+  if (list.length === 1) return said(list[0]);
   return (
     "Continue this conversation. Reply only with the next assistant message.\n\n" +
-    list.map((m) => `${m.role === "model" ? "Assistant" : "User"}: ${m.text}`).join("\n\n")
+    list.map((m) => `${m.role === "model" ? "Assistant" : "User"}: ${said(m)}`).join("\n\n")
   );
 }
 
-function cli(name: "claude" | "codex", label: string, models: string[]): Provider {
+function cli(name: "claude" | "codex", label: string, models: () => Promise<Model[]>): Provider {
   return {
     label,
+    accept: "image/png,image/jpeg,image/gif,image/webp",
     async listModels() {
       await invoke("cli_status", { cli: name }); // rejects when the CLI is missing or signed out
-      return ["default", ...models].map((m) => ({ name: m, displayName: m[0].toUpperCase() + m.slice(1) }));
+      return [{ name: "default", displayName: "Default" }, ...(await models())];
     },
     generate: (_key, model, messages) =>
-      invoke<string>("cli_ask", { cli: name, model, prompt: toTranscript(messages) }),
+      invoke<string>("cli_ask", {
+        cli: name,
+        model,
+        prompt: toTranscript(messages),
+        images: turns(messages).flatMap((m) => m.attachments ?? []),
+      }),
   };
 }
 
+type CodexModel = { slug: string; display_name: string; visibility: string; priority: number };
+
+// codex ships its own model catalog, so the list follows the installed CLI
+export function toCodexModels(catalog: string): Model[] {
+  const { models } = JSON.parse(catalog) as { models: CodexModel[] };
+  return models
+    .filter((m) => m.visibility === "list")
+    .sort((a, b) => a.priority - b.priority)
+    .map((m) => ({ name: m.slug, displayName: m.display_name }));
+}
+
 export const providers: Record<string, Provider> = {
-  "claude-cli": cli("claude", "Claude subscription", ["fable", "opus", "sonnet", "haiku"]),
-  // codex model names change often; "default" follows the user's codex config
-  "codex-cli": cli("codex", "ChatGPT subscription", []),
+  "claude-cli": cli("claude", "Claude subscription", async () =>
+    ["Fable", "Opus", "Sonnet", "Haiku"].map((m) => ({ name: m.toLowerCase(), displayName: m })),
+  ),
+  // "default" follows the user's codex config; an older codex without the catalog command offers only that
+  "codex-cli": cli("codex", "ChatGPT subscription", () =>
+    invoke<string>("codex_models").then(toCodexModels, () => []),
+  ),
   anthropic: {
     label: "Claude API",
     keyHint: "Claude API key",
@@ -166,6 +192,11 @@ if (import.meta.env.DEV) {
     ],
     "toClaudeMessages",
   );
-  same(toTranscript(chat.slice(0, 1)), "hi", "toTranscript");
-  same(toTranscript(chat).split("\n\n").slice(1), ["User: hi", "Assistant: yo"], "toTranscript");
+  same(toTranscript(chat.slice(0, 1)), "hi\n[attached image: a.png]", "toTranscript");
+  same(toTranscript(chat).split("\n\n").slice(1), ["User: hi\n[attached image: a.png]", "Assistant: yo"], "toTranscript");
+  same(
+    toCodexModels('{"models":[{"slug":"b","display_name":"B","visibility":"list","priority":2},{"slug":"x","display_name":"X","visibility":"hide","priority":0},{"slug":"a","display_name":"A","visibility":"list","priority":1}]}'),
+    [{ name: "a", displayName: "A" }, { name: "b", displayName: "B" }],
+    "toCodexModels",
+  );
 }
