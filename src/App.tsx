@@ -68,6 +68,12 @@ function App() {
   const showError = (e: unknown) =>
     setMessages((m) => [...m, { role: "error", text: errorText(e) }]);
 
+  // the providers are sent the whole chat each time, so dropping the messages is the whole context
+  const newChat = () => {
+    setMessages([]);
+    setModel((current) => store.get("model") || current);
+  };
+
   // Window follows content height; the root is content-sized, so this covers long input and new messages.
   useEffect(() => {
     const el = rootRef.current!;
@@ -132,10 +138,7 @@ function App() {
     const unlisten = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       const minutes = Number(store.get("clearAfter"));
       if (!focused) awaySince = Date.now();
-      else if (minutes && awaySince && Date.now() - awaySince >= minutes * 60_000) {
-        setMessages([]);
-        setModel((current) => store.get("model") || current);
-      }
+      else if (minutes && awaySince && Date.now() - awaySince >= minutes * 60_000) newChat();
     });
     return () => {
       unlisten.then((off) => off());
@@ -383,6 +386,23 @@ function App() {
               send();
             }}
           />
+          {messages.length > 0 && (
+            <button
+              type="button"
+              className="attach-button"
+              aria-label="New chat"
+              title="New chat"
+              disabled={busy} // a reply still on its way would land in the new chat
+              onClick={() => {
+                newChat();
+                textRef.current?.focus();
+              }}
+            >
+              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 4H5.5A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16h9a1.5 1.5 0 0 0 1.5-1.5V11M14.5 3.5l2 2L10 12H8v-2z" />
+              </svg>
+            </button>
+          )}
           <select
             className="model-select"
             aria-label="Model"
