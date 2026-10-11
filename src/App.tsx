@@ -3,7 +3,6 @@ import Markdown from "react-markdown";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { LogicalSize } from "@tauri-apps/api/dpi";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { Attachment, Effort, Message, Model } from "./gemini";
 import { providers } from "./providers";
@@ -13,7 +12,7 @@ const SETTINGS = "__settings";
 const BASE_EFFORTS: Effort[] = ["low", "medium", "high"];
 const EFFORT_LABELS: Record<string, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max" };
 const MAC = navigator.userAgent.includes("Mac");
-const MAX_HEIGHT = 0.7 * window.screen.availHeight;
+const MAX_HEIGHT = 0.6 * window.screen.availHeight;
 
 // localStorage can throw (private mode, blocked site data); never let that break rendering
 const store = {
@@ -73,7 +72,7 @@ function App() {
     const el = rootRef.current!;
     const observer = new ResizeObserver(() => {
       const height = Math.max(64, Math.min(el.offsetHeight, MAX_HEIGHT));
-      getCurrentWindow().setSize(new LogicalSize(720, height)).catch(console.error);
+      invoke("resize", { height }).catch(console.error);
     });
     observer.observe(el);
     return () => observer.disconnect();

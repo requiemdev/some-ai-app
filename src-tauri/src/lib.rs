@@ -27,10 +27,8 @@ fn toggle(app: &tauri::AppHandle) -> tauri::Result<()> {
     show(app)
 }
 
-fn show(app: &tauri::AppHandle) -> tauri::Result<()> {
-    let Some(window) = app.get_webview_window("main") else {
-        return Ok(());
-    };
+// Top edge 22% down the screen; a chat tall enough to hang below centre is raised to sit centred instead.
+fn place(window: &tauri::WebviewWindow, height: u32) -> tauri::Result<()> {
     let monitor = match window.current_monitor()? {
         Some(m) => Some(m),
         None => window.primary_monitor()?,
@@ -39,11 +37,31 @@ fn show(app: &tauri::AppHandle) -> tauri::Result<()> {
         // Monitor position/size and outer_size are all physical pixels, so the
         // monitor's origin and scale factor are already accounted for.
         let (pos, size, win) = (monitor.position(), monitor.size(), window.outer_size()?);
+        let top = (size.height as f64 * 0.22) as i32;
         window.set_position(PhysicalPosition::new(
             pos.x + (size.width as i32 - win.width as i32) / 2,
-            pos.y + (size.height as f64 * 0.22) as i32,
+            pos.y + top.min((size.height as i32 - height as i32) / 2),
         ))?;
     }
+    Ok(())
+}
+
+// The webview reports its content height; size and position change together so the rule above always holds.
+#[tauri::command]
+fn resize(window: tauri::WebviewWindow, height: f64) -> Result<(), String> {
+    // placed from the requested height: outer_size can still be the old one right after set_size
+    let physical = (height * window.scale_factor().map_err(|e| e.to_string())?) as u32;
+    window
+        .set_size(tauri::LogicalSize::new(720.0, height))
+        .and_then(|_| place(&window, physical))
+        .map_err(|e| e.to_string())
+}
+
+fn show(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    place(&window, window.outer_size()?.height)?;
     // set_focus would activate the app, defeating the non-activating panel.
     #[cfg(target_os = "macos")]
     {
@@ -388,7 +406,7 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![cli_status, cli_ask, codex_models, set_shortcut])
+        .invoke_handler(tauri::generate_handler![cli_status, cli_ask, codex_models, set_shortcut, resize])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
