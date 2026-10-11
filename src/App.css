@@ -398,6 +398,12 @@ body {
     url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12' fill='none' stroke='%23ebebf5' stroke-opacity='.75' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M2.5 4.5 6 8l3.5-3.5'/%3E%3C/svg%3E");
 }
 
+/* WebView2 draws the option list itself: without this it is white under the inherited light text. macOS uses a native menu and ignores it. */
+.model-select option {
+  background-color: #1c1c1e;
+  color: #fff;
+}
+
 .attach-button:hover,
 .chip-remove:hover,
 .model-select:hover {
