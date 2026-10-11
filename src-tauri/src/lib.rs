@@ -348,22 +348,27 @@ fn keys() -> (bool, bool) {
     #[link(name = "CoreGraphics", kind = "framework")]
     unsafe extern "C" {
         fn CGEventSourceFlagsState(state: i32) -> u64;
-        fn CGEventSourceSecondsSinceLastEventType(state: i32, event: u32) -> f64;
+        fn CGEventSourceCounterForEventType(state: i32, event: u32) -> u32;
     }
     const SESSION: i32 = 0; // kCGEventSourceStateCombinedSessionState
-    const LEFT_MOUSE_DOWN: u32 = 1;
-    const KEY_DOWN: u32 = 10;
+    const HID: i32 = 1; // kCGEventSourceStateHIDSystemState
+    const DOWNS: [u32; 4] = [1, 3, 10, 25]; // left mouse, right mouse, key, other mouse
     const CMD: u64 = 0x10_0000;
     const MODIFIERS: u64 = 0x1E_0000; // shift, control, option, command
-    let (mods, idle) = unsafe {
+    // counted, not sampled: a key tapped between two polls still shows, however late the poll runs
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let (mods, downs) = unsafe {
         (
             CGEventSourceFlagsState(SESSION) & MODIFIERS,
-            CGEventSourceSecondsSinceLastEventType(SESSION, KEY_DOWN)
-                .min(CGEventSourceSecondsSinceLastEventType(SESSION, LEFT_MOUSE_DOWN)),
+            // both states: the session one never sees a key the system takes as a hotkey (Cmd+Tab)
+            [SESSION, HID].iter().flat_map(|&state| DOWNS.iter().map(move |&event| (state, event))).fold(
+                0u32,
+                |sum, (state, event)| sum.wrapping_add(CGEventSourceCounterForEventType(state, event)),
+            ),
         )
     };
-    // a press within the last two polls is seen by at least one of them
-    (mods & CMD != 0, mods != CMD && mods != 0 || idle < 2.0 * POLL.as_secs_f64())
+    let pressed = SEEN.swap(downs, std::sync::atomic::Ordering::Relaxed) != downs;
+    (mods & CMD != 0, mods != CMD && mods != 0 || pressed)
 }
 
 #[cfg(windows)]
