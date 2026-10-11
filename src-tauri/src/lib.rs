@@ -140,7 +140,52 @@ fn cli_status(cli: String) -> Result<(), String> {
 }
 
 #[tauri::command(async)]
-fn cli_ask(cli: String, model: String, prompt: String) -> Result<String, String> {
+fn codex_models() -> Result<String, String> {
+    run_cli("codex", &["debug", "models"], "")
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Image {
+    mime_type: String,
+    data: String, // base64
+}
+
+// The formats both CLIs take. The extension lands in a temp file name, so it is never the webview's text.
+fn image_ext(mime: &str) -> Result<&'static str, String> {
+    match mime {
+        "image/png" => Ok("png"),
+        "image/jpeg" => Ok("jpg"),
+        "image/gif" => Ok("gif"),
+        "image/webp" => Ok("webp"),
+        _ => Err(format!(
+            "Subscriptions take PNG, JPEG, GIF or WebP images only, not {mime}"
+        )),
+    }
+}
+
+// `claude` only takes images as stream-json; the last "result" line of the stream holds the answer.
+fn claude_answer(stream: &str) -> Option<Result<String, String>> {
+    let result = stream
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["type"] == "result")?;
+    let text = result["result"].as_str().unwrap_or_default().to_string();
+    Some(if result["is_error"] == true {
+        Err(text)
+    } else {
+        Ok(text)
+    })
+}
+
+#[tauri::command(async)]
+fn cli_ask(
+    cli: String,
+    model: String,
+    prompt: String,
+    images: Vec<Image>,
+) -> Result<String, String> {
     // The model becomes a command-line argument: keep it to a plain name, never a flag.
     if !model.starts_with(|c: char| c.is_ascii_alphanumeric())
         || !model
@@ -149,18 +194,62 @@ fn cli_ask(cli: String, model: String, prompt: String) -> Result<String, String>
     {
         return Err(format!("invalid model name: {model}"));
     }
+    let exts = images
+        .iter()
+        .map(|i| image_ext(&i.mime_type))
+        .collect::<Result<Vec<_>, _>>()?;
+    let model_args: &[&str] = if model == "default" {
+        &[]
+    } else {
+        &["--model", &model]
+    };
     // Chat only: no tools, no user customizations, nothing written to the CLI's session history.
-    let mut args = if cli == "claude" {
-        vec![
+    if cli == "claude" {
+        let mut args = vec![
             "-p",
             "--safe-mode",
             "--strict-mcp-config",
             "--no-session-persistence",
             "--tools",
             "",
-        ]
-    } else {
-        vec![
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose", // stream-json output requires it
+        ];
+        args.extend(model_args);
+        let mut content: Vec<_> = images
+            .iter()
+            .map(|i| {
+                serde_json::json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": i.mime_type, "data": i.data }
+                })
+            })
+            .collect();
+        content.push(serde_json::json!({ "type": "text", "text": prompt }));
+        let input = serde_json::json!({ "type": "user", "message": { "role": "user", "content": content } });
+        // A failed turn still reports through the stream, so look there before trusting the exit status.
+        let (Ok(out) | Err(out)) = run_cli(&cli, &args, &format!("{input}\n"));
+        return claude_answer(&out).unwrap_or(Err(out));
+    }
+    // `codex exec` takes images as files only.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let mut files = Vec::new();
+    let result = (|| {
+        for (image, ext) in images.iter().zip(exts) {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .map_err(|e| format!("unreadable image: {e}"))?;
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("some-ai-app-{}-{n}.{ext}", std::process::id()));
+            files.push(path.to_string_lossy().into_owned());
+            std::fs::write(&path, bytes).map_err(|e| format!("could not store image: {e}"))?;
+        }
+        let mut args = vec![
             "exec",
             "--skip-git-repo-check",
             "--ephemeral",
@@ -168,12 +257,16 @@ fn cli_ask(cli: String, model: String, prompt: String) -> Result<String, String>
             "read-only",
             "--color",
             "never",
-        ]
-    };
-    if model != "default" {
-        args.extend(["--model", &model]);
+        ];
+        args.extend(model_args);
+        // --image takes several values, so each file gets its own flag and they go last
+        args.extend(files.iter().flat_map(|f| ["--image", f.as_str()]));
+        run_cli(&cli, &args, &prompt)
+    })();
+    for file in &files {
+        let _ = std::fs::remove_file(file);
     }
-    run_cli(&cli, &args, &prompt)
+    result
 }
 
 #[cfg(test)]
@@ -187,11 +280,47 @@ mod tests {
             cli_ask(
                 "claude".into(),
                 "--dangerously-skip-permissions".into(),
-                "hi".into()
+                "hi".into(),
+                vec![]
             )
             .is_err()
         );
-        assert!(cli_ask("claude".into(), "a b".into(), "hi".into()).is_err());
+        assert!(cli_ask("claude".into(), "a b".into(), "hi".into(), vec![]).is_err());
+        // an image type is never passed through to a file name or the CLI
+        let svg = Image {
+            mime_type: "image/svg+xml".into(),
+            data: String::new(),
+        };
+        assert!(cli_ask("codex".into(), "default".into(), "hi".into(), vec![svg]).is_err());
+    }
+
+    #[test]
+    fn claude_answer_reads_the_result_line() {
+        let stream =
+            "{\"type\":\"assistant\"}\n{\"type\":\"result\",\"is_error\":false,\"result\":\"Red\"}";
+        assert_eq!(claude_answer(stream), Some(Ok("Red".into())));
+        let failed = "{\"type\":\"result\",\"is_error\":true,\"result\":\"limit\"}";
+        assert_eq!(claude_answer(failed), Some(Err("limit".into())));
+        assert_eq!(claude_answer("not json"), None);
+    }
+
+    // Needs both CLIs installed and signed in: cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn subscriptions_see_images() {
+        // 1x1 red PNG
+        let red = || {
+            Image {
+            mime_type: "image/png".into(),
+            data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==".into(),
+        }
+        };
+        for cli in ["claude", "codex"] {
+            let prompt = "What single color fills this image? Answer in one word.";
+            let answer = cli_ask(cli.into(), "default".into(), prompt.into(), vec![red()]).unwrap();
+            assert!(answer.to_lowercase().contains("red"), "{cli}: {answer}");
+        }
+        assert!(codex_models().unwrap().contains("\"slug\""));
     }
 }
 
@@ -202,7 +331,7 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![cli_status, cli_ask])
+        .invoke_handler(tauri::generate_handler![cli_status, cli_ask, codex_models])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {

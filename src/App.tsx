@@ -140,6 +140,9 @@ function App() {
   function addFiles(files: FileList | null) {
     // shortcut: inline attachments are capped by Gemini's ~20 MB request size, switch to the Files API for larger files
     Array.from(files ?? []).forEach((file) => {
+      // the picker filters by itself; a paste does not
+      if (active.accept && !active.accept.split(",").includes(file.type))
+        return showError(`${active.label} takes PNG, JPEG, GIF or WebP images only, not ${file.name}`);
       const reader = new FileReader();
       reader.onload = () =>
         setAttachments((a) => [
@@ -248,26 +251,24 @@ function App() {
 
       {active ? (
         <div className="input-row">
-          {/* subscription CLIs take text only */}
-          {active.keyHint && (
-            <button
-              type="button"
-              className="attach-button"
-              aria-label="Attach files"
-              onClick={() => {
-                picking.current = true;
-                fileRef.current?.click();
-              }}
-            >
-              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
-                <path d="M10 3.5v13M3.5 10h13" />
-              </svg>
-            </button>
-          )}
+          <button
+            type="button"
+            className="attach-button"
+            aria-label="Attach files"
+            onClick={() => {
+              picking.current = true;
+              fileRef.current?.click();
+            }}
+          >
+            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
+              <path d="M10 3.5v13M3.5 10h13" />
+            </svg>
+          </button>
           <input
             ref={fileRef}
             className="file-input"
             type="file"
+            accept={active.accept}
             multiple
             hidden
             onChange={(e) => {
@@ -284,6 +285,11 @@ function App() {
             aria-label="Message"
             value={input}
             onChange={(e) => setInput(e.target.value)}
+            onPaste={(e) => {
+              if (!e.clipboardData.files.length) return; // plain text pastes as usual
+              e.preventDefault();
+              addFiles(e.clipboardData.files);
+            }}
             onKeyDown={(e) => {
               if (!isSubmit(e)) return;
               e.preventDefault();
