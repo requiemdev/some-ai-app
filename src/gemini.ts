@@ -1,0 +1,77 @@
+const BASE = "https://generativelanguage.googleapis.com/v1beta";
+
+export type Attachment = { name: string; mimeType: string; data: string };
+export type Message = {
+  role: "user" | "model" | "error";
+  text: string;
+  attachments?: Attachment[];
+};
+export type Model = {
+  name: string; // "models/gemini-..."
+  displayName: string;
+  supportedGenerationMethods?: string[];
+};
+
+async function call(key: string, path: string, init?: RequestInit) {
+  const res = await fetch(`${BASE}/${path}`, {
+    ...init,
+    headers: { "x-goog-api-key": key, "Content-Type": "application/json" },
+  });
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(body?.error?.message ?? `Gemini request failed (${res.status})`);
+  }
+  return body;
+}
+
+export async function listModels(key: string): Promise<Model[]> {
+  const models: Model[] = [];
+  let pageToken = "";
+  do {
+    const body = await call(key, `models?pageSize=1000&pageToken=${encodeURIComponent(pageToken)}`);
+    models.push(...(body?.models ?? []));
+    pageToken = body?.nextPageToken ?? "";
+  } while (pageToken);
+  return models.filter((m) => m.supportedGenerationMethods?.includes("generateContent"));
+}
+
+export function toContents(messages: Message[]) {
+  return messages
+    .filter((m) => m.role !== "error")
+    .map((m) => ({
+      role: m.role,
+      parts: [
+        ...(m.text ? [{ text: m.text }] : []),
+        ...(m.attachments ?? []).map((a) => ({
+          inline_data: { mime_type: a.mimeType, data: a.data },
+        })),
+      ],
+    }));
+}
+
+if (import.meta.env.DEV) {
+  const got = toContents([
+    { role: "user", text: "hi", attachments: [{ name: "a.png", mimeType: "image/png", data: "QQ==" }] },
+    { role: "error", text: "boom" },
+    { role: "model", text: "yo" },
+  ]);
+  const want = [
+    { role: "user", parts: [{ text: "hi" }, { inline_data: { mime_type: "image/png", data: "QQ==" } }] },
+    { role: "model", parts: [{ text: "yo" }] },
+  ];
+  console.assert(JSON.stringify(got) === JSON.stringify(want), "toContents self-check failed", got);
+}
+
+export async function generate(key: string, model: string, messages: Message[]): Promise<string> {
+  // model is the full resource name from listModels ("models/...")
+  const body = await call(key, `${model}:generateContent`, {
+    method: "POST",
+    body: JSON.stringify({ contents: toContents(messages) }),
+  });
+  const parts: { text?: string }[] | undefined = body?.candidates?.[0]?.content?.parts;
+  if (!parts) {
+    const reason = body?.promptFeedback?.blockReason ?? body?.candidates?.[0]?.finishReason;
+    throw new Error(reason ? `Gemini returned no answer (${reason})` : "Gemini returned no answer");
+  }
+  return parts.map((p) => p.text ?? "").join("");
+}
