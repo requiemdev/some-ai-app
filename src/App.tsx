@@ -3,10 +3,11 @@ import Markdown from "react-markdown";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { generate, listModels, type Attachment, type Message, type Model } from "./gemini";
+import type { Attachment, Message, Model } from "./gemini";
+import { providers } from "./providers";
 import "./App.css";
 
-const CHANGE_KEY = "__change_key";
+const CHANGE_PROVIDER = "__change_provider";
 const MAX_HEIGHT = 0.7 * window.screen.availHeight;
 
 // localStorage can throw (private mode, blocked site data); never let that break rendering
@@ -31,6 +32,9 @@ const store = {
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 function App() {
+  // installs from before onboarding only stored a Gemini key
+  const [provider, setProvider] = useState(() => store.get("provider") || (store.get("apiKey") && "gemini"));
+  const [choice, setChoice] = useState(() => Object.keys(providers)[0]);
   const [apiKey, setApiKey] = useState(() => store.get("apiKey"));
   const [models, setModels] = useState<Model[]>([]);
   const [model, setModel] = useState(() => store.get("model"));
@@ -43,6 +47,7 @@ function App() {
   const listRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const active = providers[provider]; // undefined until onboarding is done
   // The native file picker takes focus from the window; that must not count as clicking outside.
   const picking = useRef(false);
 
@@ -62,7 +67,7 @@ function App() {
 
   useEffect(() => {
     const focusInput = () =>
-      rootRef.current?.querySelector<HTMLElement>("textarea, input[type=password]")?.focus();
+      rootRef.current?.querySelector<HTMLElement>("textarea, input[type=password], .connect-button")?.focus();
     const onKeyDown = (e: KeyboardEvent) => {
       // Esc during IME composition cancels the composition, not the window
       if (e.key === "Escape" && !e.isComposing) getCurrentWindow().hide().catch(console.error);
@@ -82,9 +87,10 @@ function App() {
 
   useEffect(() => {
     setModels([]);
-    if (!apiKey) return;
+    if (!active) return;
     let stale = false;
-    listModels(apiKey)
+    active
+      .listModels(apiKey)
       .then((list) => {
         if (stale) return;
         setModels(list);
@@ -94,14 +100,14 @@ function App() {
     return () => {
       stale = true;
     };
-  }, [apiKey]);
+  }, [provider, apiKey]);
 
   useLayoutEffect(() => {
     const el = textRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
-  }, [input, apiKey]);
+  }, [input, provider]);
 
   useEffect(() => {
     listRef.current?.scrollTo(0, listRef.current.scrollHeight);
@@ -111,13 +117,24 @@ function App() {
   const isSubmit = (e: React.KeyboardEvent) =>
     e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229;
 
-  function saveKey() {
-    const value = input.trim();
-    if (!value) return;
-    // shortcut: the API key is stored in plaintext localStorage, move it to the OS keychain before shipping beyond personal use
-    store.set("apiKey", value);
-    setApiKey(value);
-    setInput("");
+  async function connect() {
+    const key = providers[choice].keyHint ? input.trim() : "";
+    if (busy || (providers[choice].keyHint && !key)) return;
+    setBusy(true);
+    try {
+      await providers[choice].listModels(key); // proves the key or CLI login works before leaving onboarding
+      // shortcut: the API key is stored in plaintext localStorage, move it to the OS keychain before shipping beyond personal use
+      store.set("apiKey", key);
+      store.set("provider", choice);
+      setApiKey(key);
+      setProvider(choice);
+      setInput("");
+      setMessages((m) => m.filter((x) => x.role !== "error"));
+    } catch (e) {
+      showError(e);
+    } finally {
+      setBusy(false);
+    }
   }
 
   function addFiles(files: FileList | null) {
@@ -147,7 +164,7 @@ function App() {
     setAttachments([]);
     setBusy(true);
     try {
-      const reply = await generate(apiKey, model, next);
+      const reply = await active.generate(apiKey, model, next);
       setMessages((m) => [...m, { role: "model", text: reply }]);
     } catch (e) {
       showError(e);
@@ -157,9 +174,11 @@ function App() {
   }
 
   function onModelChange(value: string) {
-    if (value === CHANGE_KEY) {
+    if (value === CHANGE_PROVIDER) {
       store.set("apiKey", "");
+      store.set("provider", "");
       setApiKey("");
+      setProvider("");
       setInput("");
       return;
     }
@@ -227,21 +246,24 @@ function App() {
         </ul>
       )}
 
-      {apiKey ? (
+      {active ? (
         <div className="input-row">
-          <button
-            type="button"
-            className="attach-button"
-            aria-label="Attach files"
-            onClick={() => {
-              picking.current = true;
-              fileRef.current?.click();
-            }}
-          >
-            <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
-              <path d="M10 3.5v13M3.5 10h13" />
-            </svg>
-          </button>
+          {/* subscription CLIs take text only */}
+          {active.keyHint && (
+            <button
+              type="button"
+              className="attach-button"
+              aria-label="Attach files"
+              onClick={() => {
+                picking.current = true;
+                fileRef.current?.click();
+              }}
+            >
+              <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
+                <path d="M10 3.5v13M3.5 10h13" />
+              </svg>
+            </button>
+          )}
           <input
             ref={fileRef}
             className="file-input"
@@ -258,7 +280,7 @@ function App() {
             className="input"
             rows={1}
             autoFocus
-            placeholder="Ask Gemini"
+            placeholder="Ask anything"
             aria-label="Message"
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -285,25 +307,46 @@ function App() {
               </option>
             ))}
             <hr />
-            <option value={CHANGE_KEY}>Change API key</option>
+            <option value={CHANGE_PROVIDER}>Change provider</option>
           </select>
         </div>
       ) : (
         <div className="input-row">
-          <input
-            className="input key-input"
-            type="password"
-            autoFocus
-            placeholder="Paste Gemini API key"
-            aria-label="Gemini API key"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (!isSubmit(e)) return;
-              e.preventDefault();
-              saveKey();
+          {providers[choice].keyHint ? (
+            <input
+              className="input key-input"
+              type="password"
+              autoFocus
+              placeholder={`Paste ${providers[choice].keyHint}`}
+              aria-label={providers[choice].keyHint}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (!isSubmit(e)) return;
+                e.preventDefault();
+                connect();
+              }}
+            />
+          ) : (
+            <button type="button" className="input key-input connect-button" autoFocus disabled={busy} onClick={connect}>
+              {busy ? "Checking…" : `Continue with ${providers[choice].label}`}
+            </button>
+          )}
+          <select
+            className="model-select"
+            aria-label="Provider"
+            value={choice}
+            onChange={(e) => {
+              setChoice(e.target.value);
+              setInput("");
             }}
-          />
+          >
+            {Object.entries(providers).map(([id, p]) => (
+              <option key={id} value={id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
         </div>
       )}
     </main>

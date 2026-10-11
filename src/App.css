@@ -15,6 +15,11 @@
   font: 15px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
 }
 
+/* Only macOS has the blur material; elsewhere the 35% tint alone leaves the desktop showing through. */
+:root.no-material {
+  --tint: #1c1c1e;
+}
+
 @media (prefers-contrast: more) {
   :root {
     --tint: #000;
@@ -287,7 +292,7 @@ body {
   flex: 1;
   min-width: 0;
   max-height: 200px;
-  padding: 7px 0;
+  padding: 7px 8px;
   border: 0;
   outline: 0; /* the only text field, focused whenever the window is shown: the caret is the focus indicator, as in Spotlight */
   background: transparent;
@@ -310,6 +315,17 @@ body {
 .key-input {
   height: 40px;
   padding: 0 12px;
+}
+
+.connect-button {
+  border-radius: 20px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.connect-button:hover,
+.connect-button:focus-visible {
+  background-color: var(--fill);
 }
 
 .attach-button,
