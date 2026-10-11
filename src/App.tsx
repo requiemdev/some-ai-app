@@ -1,13 +1,18 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { Attachment, Message, Model } from "./gemini";
+import type { Attachment, Effort, Message, Model } from "./gemini";
 import { providers } from "./providers";
 import "./App.css";
 
-const CHANGE_PROVIDER = "__change_provider";
+const SETTINGS = "__settings";
+const BASE_EFFORTS: Effort[] = ["low", "medium", "high"];
+const EFFORT_LABELS: Record<string, string> = { low: "Low", medium: "Medium", high: "High", xhigh: "Extra high", max: "Max" };
+const MAC = navigator.userAgent.includes("Mac");
 const MAX_HEIGHT = 0.7 * window.screen.availHeight;
 
 // localStorage can throw (private mode, blocked site data); never let that break rendering
@@ -37,17 +42,26 @@ function App() {
   const [choice, setChoice] = useState(() => Object.keys(providers)[0]);
   const [apiKey, setApiKey] = useState(() => store.get("apiKey"));
   const [models, setModels] = useState<Model[]>([]);
-  const [model, setModel] = useState(() => store.get("model"));
+  // the chat's picker changes the model for this chat only; the default in settings is the stored one
+  const [defaultModel, setDefaultModel] = useState(() => store.get("model"));
+  const [model, setModel] = useState(defaultModel);
+  const [effort, setEffort] = useState(() => store.get("effort") as Effort);
   const [messages, setMessages] = useState<Message[]>([]);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [settings, setSettings] = useState(false);
+  // the format the Rust side parses: modifiers, then a KeyboardEvent.code
+  const [shortcut, setShortcut] = useState(() => store.get("shortcut") || "Ctrl+Shift+KeyA");
+  const [recording, setRecording] = useState(false);
+  const [clearAfter, setClearAfter] = useState(() => store.get("clearAfter")); // minutes; "" is never
 
   const rootRef = useRef<HTMLElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const active = providers[provider]; // undefined until onboarding is done
+  const efforts = active?.efforts ?? BASE_EFFORTS;
   // The native file picker takes focus from the window; that must not count as clicking outside.
   const picking = useRef(false);
 
@@ -85,6 +99,37 @@ function App() {
     };
   }, []);
 
+  // Rust registers the default shortcut at launch; a saved one replaces it here.
+  useEffect(() => {
+    if (store.get("shortcut")) invoke("set_shortcut", { shortcut }).catch(showError);
+  }, []);
+
+  // The tray's Settings item. Before onboarding is done, the connection row is already what shows.
+  useEffect(() => {
+    if (!provider) return;
+    const unlisten = listen("open-settings", () => toggleSettings(true));
+    return () => {
+      unlisten.then((off) => off());
+    };
+  }, [provider]);
+
+  // Auto-clear: a chat left unfocused longer than the setting starts fresh. Waiting for a reply does not count.
+  useEffect(() => {
+    if (busy) return;
+    let awaySince = document.hasFocus() ? 0 : Date.now();
+    const unlisten = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      const minutes = Number(store.get("clearAfter"));
+      if (!focused) awaySince = Date.now();
+      else if (minutes && awaySince && Date.now() - awaySince >= minutes * 60_000) {
+        setMessages([]);
+        setModel((current) => store.get("model") || current);
+      }
+    });
+    return () => {
+      unlisten.then((off) => off());
+    };
+  }, [busy]);
+
   useEffect(() => {
     setModels([]);
     if (!active) return;
@@ -107,7 +152,7 @@ function App() {
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
-  }, [input, provider]);
+  }, [input, provider, settings]);
 
   useEffect(() => {
     listRef.current?.scrollTo(0, listRef.current.scrollHeight);
@@ -125,6 +170,15 @@ function App() {
       await providers[choice].listModels(key); // proves the key or CLI login works before leaving onboarding
       // shortcut: the API key is stored in plaintext localStorage, move it to the OS keychain before shipping beyond personal use
       store.set("apiKey", key);
+      if (choice !== provider) {
+        // the default model belongs to the provider being left
+        store.set("model", "");
+        setDefaultModel("");
+        if (!(providers[choice].efforts ?? BASE_EFFORTS).includes(effort)) {
+          store.set("effort", "");
+          setEffort("");
+        }
+      }
       store.set("provider", choice);
       setApiKey(key);
       setProvider(choice);
@@ -167,7 +221,7 @@ function App() {
     setAttachments([]);
     setBusy(true);
     try {
-      const reply = await active.generate(apiKey, model, next);
+      const reply = await active.generate(apiKey, model, next, effort);
       setMessages((m) => [...m, { role: "model", text: reply }]);
     } catch (e) {
       showError(e);
@@ -176,16 +230,37 @@ function App() {
     }
   }
 
+  function toggleSettings(open: boolean) {
+    setSettings(open);
+    setChoice(provider);
+    setInput(""); // the field doubles as the key input, so a draft or half-typed key must not cross over
+  }
+
+  function recordShortcut(e: React.KeyboardEvent) {
+    if (!recording) return;
+    e.preventDefault();
+    e.stopPropagation(); // Esc cancels the recording here, instead of hiding the window
+    if (e.key === "Escape") return setRecording(false);
+    // a global shortcut without one of these would swallow ordinary typing everywhere
+    if (!(e.ctrlKey || e.altKey || e.metaKey) || ["Control", "Alt", "Shift", "Meta"].includes(e.key)) return;
+    const next = [
+      e.ctrlKey && "Ctrl",
+      e.altKey && (MAC ? "Option" : "Alt"),
+      e.shiftKey && "Shift",
+      e.metaKey && (MAC ? "Cmd" : "Super"),
+      e.code,
+    ]
+      .filter(Boolean)
+      .join("+");
+    setRecording(false);
+    invoke("set_shortcut", { shortcut: next }).then(() => {
+      store.set("shortcut", next);
+      setShortcut(next);
+    }, showError);
+  }
+
   function onModelChange(value: string) {
-    if (value === CHANGE_PROVIDER) {
-      store.set("apiKey", "");
-      store.set("provider", "");
-      setApiKey("");
-      setProvider("");
-      setInput("");
-      return;
-    }
-    store.set("model", value);
+    if (value === SETTINGS) return toggleSettings(true);
     setModel(value);
   }
 
@@ -249,7 +324,7 @@ function App() {
         </ul>
       )}
 
-      {active ? (
+      {active && !settings ? (
         <div className="input-row">
           <button
             type="button"
@@ -313,47 +388,134 @@ function App() {
               </option>
             ))}
             <hr />
-            <option value={CHANGE_PROVIDER}>Change provider</option>
+            <option value={SETTINGS}>Settings…</option>
           </select>
         </div>
       ) : (
-        <div className="input-row">
-          {providers[choice].keyHint ? (
-            <input
-              className="input key-input"
-              type="password"
-              autoFocus
-              placeholder={`Paste ${providers[choice].keyHint}`}
-              aria-label={providers[choice].keyHint}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (!isSubmit(e)) return;
-                e.preventDefault();
-                connect();
-              }}
-            />
-          ) : (
-            <button type="button" className="input key-input connect-button" autoFocus disabled={busy} onClick={connect}>
-              {busy ? "Checking…" : `Continue with ${providers[choice].label}`}
-            </button>
+        // onboarding is this same connection row, without the rest of the settings
+        <>
+          {active && (
+            <>
+              <div className="setting">
+                Shortcut to show and hide
+                <button
+                  type="button"
+                  className="model-select shortcut"
+                  aria-label={`Shortcut: ${shortcut}. Activate to change`}
+                  onClick={(e) => {
+                    e.currentTarget.focus(); // WebKit does not focus a button on click, and the key presses go to the focused element
+                    setRecording(!recording);
+                  }}
+                  onBlur={() => setRecording(false)}
+                  onKeyDown={recordShortcut}
+                >
+                  {recording ? "Press new shortcut…" : shortcut.replace(/\+(Key|Digit)/, "+")}
+                </button>
+              </div>
+              <label className="setting">
+                Clear chat when away for
+                <select
+                  className="model-select"
+                  value={clearAfter}
+                  onChange={(e) => {
+                    store.set("clearAfter", e.target.value);
+                    setClearAfter(e.target.value);
+                  }}
+                >
+                  <option value="">Never</option>
+                  <option value="1">1 minute</option>
+                  <option value="5">5 minutes</option>
+                  <option value="15">15 minutes</option>
+                  <option value="60">1 hour</option>
+                </select>
+              </label>
+              <hr className="setting-divider" />
+              <label className="setting">
+                Default model
+                <select
+                  className="model-select"
+                  disabled={choice !== provider} // these two rows follow the connected provider, not the one being picked
+                  value={models.some((m) => m.name === defaultModel) ? defaultModel : ""}
+                  onChange={(e) => {
+                    store.set("model", e.target.value);
+                    setDefaultModel(e.target.value);
+                    setModel(e.target.value || (models[0]?.name ?? ""));
+                  }}
+                >
+                  <option value="">First listed</option>
+                  {models.map((m) => (
+                    <option key={m.name} value={m.name}>
+                      {m.displayName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="setting">
+                Effort
+                <select
+                  className="model-select"
+                  disabled={choice !== provider}
+                  value={effort}
+                  onChange={(e) => {
+                    store.set("effort", e.target.value);
+                    setEffort(e.target.value as Effort);
+                  }}
+                >
+                  <option value="">Provider default</option>
+                  {efforts.map((e) => (
+                    <option key={e} value={e}>
+                      {EFFORT_LABELS[e]}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </>
           )}
-          <select
-            className="model-select"
-            aria-label="Provider"
-            value={choice}
-            onChange={(e) => {
-              setChoice(e.target.value);
-              setInput("");
-            }}
-          >
-            {Object.entries(providers).map(([id, p]) => (
-              <option key={id} value={id}>
-                {p.label}
-              </option>
-            ))}
-          </select>
-        </div>
+          <div className="input-row">
+            {active && (
+              <button type="button" className="attach-button" aria-label="Close settings" onClick={() => toggleSettings(false)}>
+                <svg aria-hidden="true" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round">
+                  <path d="M5 5l10 10M15 5L5 15" />
+                </svg>
+              </button>
+            )}
+            {providers[choice].keyHint ? (
+              <input
+                className="input key-input"
+                type="password"
+                autoFocus
+                placeholder={choice === provider ? `${providers[choice].keyHint} saved` : `Paste ${providers[choice].keyHint}`}
+                aria-label={providers[choice].keyHint}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (!isSubmit(e)) return;
+                  e.preventDefault();
+                  connect();
+                }}
+              />
+            ) : (
+              <button type="button" className="input key-input connect-button" autoFocus disabled={busy} onClick={connect}>
+                {busy ? "Checking…" : choice === provider ? `${providers[choice].label} connected` : `Continue with ${providers[choice].label}`}
+              </button>
+            )}
+            <select
+              className="model-select"
+              aria-label="Provider"
+              value={choice}
+              onChange={(e) => {
+                setChoice(e.target.value);
+                setInput("");
+              }}
+            >
+              {Object.entries(providers).map(([id, p]) => (
+                <option key={id} value={id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </>
       )}
     </main>
   );

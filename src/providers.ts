@@ -1,7 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { invoke } from "@tauri-apps/api/core";
 import * as gemini from "./gemini";
-import type { Message, Model } from "./gemini";
+import type { Effort, Message, Model } from "./gemini";
 
 export type Provider = {
   label: string;
@@ -9,8 +9,10 @@ export type Provider = {
   keyHint?: string;
   // file types the attach picker offers; unset means any
   accept?: string;
+  // levels the effort setting offers; unset means low, medium and high
+  efforts?: Effort[];
   listModels(key: string): Promise<Model[]>;
-  generate(key: string, model: string, messages: Message[]): Promise<string>;
+  generate(key: string, model: string, messages: Message[], effort: Effort): Promise<string>;
 };
 
 const turns = (messages: Message[]) => messages.filter((m) => m.role !== "error");
@@ -89,18 +91,22 @@ export function toTranscript(messages: Message[]) {
   );
 }
 
-function cli(name: "claude" | "codex", label: string, models: () => Promise<Model[]>): Provider {
+const CLAUDE_EFFORTS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
+
+function cli(name: "claude" | "codex", label: string, models: () => Promise<Model[]>, efforts?: Effort[]): Provider {
   return {
     label,
+    efforts,
     accept: "image/png,image/jpeg,image/gif,image/webp",
     async listModels() {
       await invoke("cli_status", { cli: name }); // rejects when the CLI is missing or signed out
       return [{ name: "default", displayName: "Default" }, ...(await models())];
     },
-    generate: (_key, model, messages) =>
+    generate: (_key, model, messages, effort) =>
       invoke<string>("cli_ask", {
         cli: name,
         model,
+        effort,
         prompt: toTranscript(messages),
         images: turns(messages).flatMap((m) => m.attachments ?? []),
       }),
@@ -119,8 +125,11 @@ export function toCodexModels(catalog: string): Model[] {
 }
 
 export const providers: Record<string, Provider> = {
-  "claude-cli": cli("claude", "Claude subscription", async () =>
-    ["Fable", "Opus", "Sonnet", "Haiku"].map((m) => ({ name: m.toLowerCase(), displayName: m })),
+  "claude-cli": cli(
+    "claude",
+    "Claude subscription",
+    async () => ["Fable", "Opus", "Sonnet", "Haiku"].map((m) => ({ name: m.toLowerCase(), displayName: m })),
+    CLAUDE_EFFORTS,
   ),
   // "default" follows the user's codex config; an older codex without the catalog command offers only that
   "codex-cli": cli("codex", "ChatGPT subscription", () =>
@@ -129,16 +138,18 @@ export const providers: Record<string, Provider> = {
   anthropic: {
     label: "Claude API",
     keyHint: "Claude API key",
+    efforts: CLAUDE_EFFORTS,
     async listModels(key) {
       const models: Model[] = [];
       for await (const m of claude(key).models.list()) models.push({ name: m.id, displayName: m.display_name });
       return models;
     },
-    async generate(key, model, messages) {
+    async generate(key, model, messages, effort) {
       const res = await claude(key).messages.create({
         model,
         max_tokens: 16000,
         messages: toClaudeMessages(messages),
+        ...(effort && { output_config: { effort } }),
       });
       if (res.stop_reason === "refusal") throw new Error("Claude declined to answer");
       return res.content.map((b) => (b.type === "text" ? b.text : "")).join("");
@@ -156,8 +167,12 @@ export const providers: Record<string, Provider> = {
         .sort((a, b) => b.created - a.created)
         .map((m) => ({ name: m.id, displayName: m.id }));
     },
-    async generate(key, model, messages) {
-      const body = await openai(key, "responses", { model, input: toOpenAIInput(messages) });
+    async generate(key, model, messages, effort) {
+      const body = await openai(key, "responses", {
+        model,
+        input: toOpenAIInput(messages),
+        ...(effort && { reasoning: { effort } }),
+      });
       const parts: { text?: string; refusal?: string }[] = (body?.output ?? []).flatMap(
         (item: { type: string; content?: unknown[] }) => (item.type === "message" ? (item.content ?? []) : []),
       );
