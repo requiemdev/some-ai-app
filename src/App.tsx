@@ -54,6 +54,7 @@ function App() {
   const [shortcut, setShortcut] = useState(() => store.get("shortcut") || "Ctrl+Shift+KeyA");
   const [recording, setRecording] = useState(false);
   const [clearAfter, setClearAfter] = useState(() => store.get("clearAfter")); // minutes; "" is never
+  const [doubleTap, setDoubleTap] = useState(() => store.get("doubleTap")); // "off", or "" for on
 
   const rootRef = useRef<HTMLElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -111,6 +112,18 @@ function App() {
       unlisten.then((off) => off());
     };
   }, [provider]);
+
+  // Double-tapping Command (Ctrl off macOS): Rust took the screenshot and opened the window.
+  useEffect(() => {
+    if (doubleTap) invoke("set_double_tap", { enabled: false }).catch(showError); // Rust starts with it on
+    const unlisten = [
+      listen<string>("screenshot", ({ payload: data }) =>
+        setAttachments((a) => [...a, { name: "screenshot.jpg", mimeType: "image/jpeg", data }]),
+      ),
+      listen<string>("screenshot-failed", ({ payload }) => showError(`Screenshot failed: ${payload}`)),
+    ];
+    return () => unlisten.forEach((u) => u.then((off) => off()));
+  }, []);
 
   // Auto-clear: a chat left unfocused longer than the setting starts fresh. Waiting for a reply does not count.
   useEffect(() => {
@@ -426,6 +439,23 @@ function App() {
                   <option value="5">5 minutes</option>
                   <option value="15">15 minutes</option>
                   <option value="60">1 hour</option>
+                </select>
+              </label>
+              <label className="setting">
+                Double-tap {MAC ? "Command" : "Ctrl"} to attach a screenshot
+                <select
+                  className="model-select"
+                  value={doubleTap}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    invoke("set_double_tap", { enabled: !value }).then(() => {
+                      store.set("doubleTap", value);
+                      setDoubleTap(value);
+                    }, showError);
+                  }}
+                >
+                  <option value="">On</option>
+                  <option value="off">Off</option>
                 </select>
               </label>
               <hr className="setting-divider" />
