@@ -100,7 +100,9 @@ function cli(name: "claude" | "codex", label: string, models: () => Promise<Mode
     accept: "image/png,image/jpeg,image/gif,image/webp",
     async listModels() {
       await invoke("cli_status", { cli: name }); // rejects when the CLI is missing or signed out
-      return [{ name: "default", displayName: "Default" }, ...(await models())];
+      const list = await models();
+      // "default" leaves the model to the CLI's own config; offered only when there is no list to pick from
+      return list.length ? list : [{ name: "default", displayName: "Default" }];
     },
     generate: (_key, model, messages, effort) =>
       invoke<string>("cli_ask", {
@@ -131,7 +133,7 @@ export const providers: Record<string, Provider> = {
     async () => ["Fable", "Opus", "Sonnet", "Haiku"].map((m) => ({ name: m.toLowerCase(), displayName: m })),
     CLAUDE_EFFORTS,
   ),
-  // "default" follows the user's codex config; an older codex without the catalog command offers only that
+  // an older codex without the catalog command lists nothing
   "codex-cli": cli("codex", "ChatGPT subscription", () =>
     invoke<string>("codex_models").then(toCodexModels, () => []),
   ),

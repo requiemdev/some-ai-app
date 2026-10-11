@@ -162,26 +162,26 @@ function App() {
   const isSubmit = (e: React.KeyboardEvent) =>
     e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229;
 
-  async function connect() {
-    const key = providers[choice].keyHint ? input.trim() : "";
-    if (busy || (providers[choice].keyHint && !key)) return;
+  async function connect(id = choice) {
+    const key = providers[id].keyHint ? input.trim() : "";
+    if (busy || (providers[id].keyHint && !key)) return;
     setBusy(true);
     try {
-      await providers[choice].listModels(key); // proves the key or CLI login works before leaving onboarding
+      await providers[id].listModels(key); // proves the key or CLI login works before leaving onboarding
       // shortcut: the API key is stored in plaintext localStorage, move it to the OS keychain before shipping beyond personal use
       store.set("apiKey", key);
-      if (choice !== provider) {
+      if (id !== provider) {
         // the default model belongs to the provider being left
         store.set("model", "");
         setDefaultModel("");
-        if (!(providers[choice].efforts ?? BASE_EFFORTS).includes(effort)) {
+        if (!(providers[id].efforts ?? BASE_EFFORTS).includes(effort)) {
           store.set("effort", "");
           setEffort("");
         }
       }
-      store.set("provider", choice);
+      store.set("provider", id);
       setApiKey(key);
-      setProvider(choice);
+      setProvider(id);
       setInput("");
       setMessages((m) => m.filter((x) => x.role !== "error"));
     } catch (e) {
@@ -435,14 +435,13 @@ function App() {
                 <select
                   className="model-select"
                   disabled={choice !== provider} // these two rows follow the connected provider, not the one being picked
-                  value={models.some((m) => m.name === defaultModel) ? defaultModel : ""}
+                  value={models.some((m) => m.name === defaultModel) ? defaultModel : models[0]?.name} // nothing saved means the first one
                   onChange={(e) => {
                     store.set("model", e.target.value);
                     setDefaultModel(e.target.value);
-                    setModel(e.target.value || (models[0]?.name ?? ""));
+                    setModel(e.target.value);
                   }}
                 >
-                  <option value="">First listed</option>
                   {models.map((m) => (
                     <option key={m.name} value={m.name}>
                       {m.displayName}
@@ -495,8 +494,8 @@ function App() {
                 }}
               />
             ) : (
-              <button type="button" className="input key-input connect-button" autoFocus disabled={busy} onClick={connect}>
-                {busy ? "Checking…" : choice === provider ? `${providers[choice].label} connected` : `Continue with ${providers[choice].label}`}
+              <button type="button" className="input key-input connect-button" autoFocus disabled={busy} onClick={() => connect()}>
+                {busy ? "Checking…" : choice === provider ? `${providers[choice].label} connected` : `Connect ${providers[choice].label}`}
               </button>
             )}
             <select
@@ -504,8 +503,11 @@ function App() {
               aria-label="Provider"
               value={choice}
               onChange={(e) => {
-                setChoice(e.target.value);
+                const id = e.target.value;
+                setChoice(id);
                 setInput("");
+                // a subscription has nothing to enter, so picking it connects; the button is left for a retry
+                if (!providers[id].keyHint && id !== provider) connect(id);
               }}
             >
               {Object.entries(providers).map(([id, p]) => (
