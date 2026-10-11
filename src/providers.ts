@@ -1,0 +1,171 @@
+import Anthropic from "@anthropic-ai/sdk";
+import { invoke } from "@tauri-apps/api/core";
+import * as gemini from "./gemini";
+import type { Message, Model } from "./gemini";
+
+export type Provider = {
+  label: string;
+  // API-key providers only; subscription providers reuse the login of the user's installed CLI
+  keyHint?: string;
+  listModels(key: string): Promise<Model[]>;
+  generate(key: string, model: string, messages: Message[]): Promise<string>;
+};
+
+const turns = (messages: Message[]) => messages.filter((m) => m.role !== "error");
+const dataUrl = (a: { mimeType: string; data: string }) => `data:${a.mimeType};base64,${a.data}`;
+
+// ---------- OpenAI API ----------
+
+async function openai(key: string, path: string, body?: unknown) {
+  const res = await fetch(`https://api.openai.com/v1/${path}`, {
+    method: body ? "POST" : "GET",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(json?.error?.message ?? `OpenAI request failed (${res.status})`);
+  return json;
+}
+
+export function toOpenAIInput(messages: Message[]) {
+  return turns(messages).map((m) =>
+    m.role === "model"
+      ? { role: "assistant", content: m.text }
+      : {
+          role: "user",
+          content: [
+            ...(m.attachments ?? []).map((a) =>
+              a.mimeType.startsWith("image/")
+                ? { type: "input_image", image_url: dataUrl(a) }
+                : { type: "input_file", filename: a.name, file_data: dataUrl(a) },
+            ),
+            ...(m.text ? [{ type: "input_text", text: m.text }] : []),
+          ],
+        },
+  );
+}
+
+// ---------- Claude API ----------
+
+const claude = (key: string) => new Anthropic({ apiKey: key, dangerouslyAllowBrowser: true });
+
+// shortcut: only images and PDFs are sent as attachments (the API rejects other types), add text documents when needed
+export function toClaudeMessages(messages: Message[]): Anthropic.MessageParam[] {
+  return turns(messages).map((m) => ({
+    role: m.role === "model" ? "assistant" : "user",
+    content: [
+      ...(m.attachments ?? []).map(
+        (a): Anthropic.ContentBlockParam =>
+          a.mimeType === "application/pdf"
+            ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: a.data } }
+            : {
+                type: "image",
+                source: {
+                  type: "base64",
+                  media_type: a.mimeType as Anthropic.Base64ImageSource["media_type"],
+                  data: a.data,
+                },
+              },
+      ),
+      ...(m.text ? [{ type: "text" as const, text: m.text }] : []),
+    ],
+  }));
+}
+
+// ---------- subscriptions, through the user's own CLI login ----------
+
+// shortcut: the CLIs get the chat as one flattened prompt and no attachments, switch to their session resume / image flags when that matters
+export function toTranscript(messages: Message[]) {
+  const list = turns(messages);
+  if (list.length === 1) return list[0].text;
+  return (
+    "Continue this conversation. Reply only with the next assistant message.\n\n" +
+    list.map((m) => `${m.role === "model" ? "Assistant" : "User"}: ${m.text}`).join("\n\n")
+  );
+}
+
+function cli(name: "claude" | "codex", label: string, models: string[]): Provider {
+  return {
+    label,
+    async listModels() {
+      await invoke("cli_status", { cli: name }); // rejects when the CLI is missing or signed out
+      return ["default", ...models].map((m) => ({ name: m, displayName: m[0].toUpperCase() + m.slice(1) }));
+    },
+    generate: (_key, model, messages) =>
+      invoke<string>("cli_ask", { cli: name, model, prompt: toTranscript(messages) }),
+  };
+}
+
+export const providers: Record<string, Provider> = {
+  "claude-cli": cli("claude", "Claude subscription", ["fable", "opus", "sonnet", "haiku"]),
+  // codex model names change often; "default" follows the user's codex config
+  "codex-cli": cli("codex", "ChatGPT subscription", []),
+  anthropic: {
+    label: "Claude API",
+    keyHint: "Claude API key",
+    async listModels(key) {
+      const models: Model[] = [];
+      for await (const m of claude(key).models.list()) models.push({ name: m.id, displayName: m.display_name });
+      return models;
+    },
+    async generate(key, model, messages) {
+      const res = await claude(key).messages.create({
+        model,
+        max_tokens: 16000,
+        messages: toClaudeMessages(messages),
+      });
+      if (res.stop_reason === "refusal") throw new Error("Claude declined to answer");
+      return res.content.map((b) => (b.type === "text" ? b.text : "")).join("");
+    },
+  },
+  openai: {
+    label: "OpenAI API",
+    keyHint: "OpenAI API key",
+    async listModels(key) {
+      const body = await openai(key, "models");
+      const data: { id: string; created: number }[] = body?.data ?? [];
+      // /models also lists embedding, audio and image models, which cannot chat
+      return data
+        .filter((m) => /^(gpt-|o\d|chatgpt-)/.test(m.id) && !/audio|realtime|image|tts|transcribe|search|instruct/.test(m.id))
+        .sort((a, b) => b.created - a.created)
+        .map((m) => ({ name: m.id, displayName: m.id }));
+    },
+    async generate(key, model, messages) {
+      const body = await openai(key, "responses", { model, input: toOpenAIInput(messages) });
+      const parts: { text?: string; refusal?: string }[] = (body?.output ?? []).flatMap(
+        (item: { type: string; content?: unknown[] }) => (item.type === "message" ? (item.content ?? []) : []),
+      );
+      if (!parts.length) throw new Error("OpenAI returned no answer");
+      return parts.map((p) => p.text ?? p.refusal ?? "").join("");
+    },
+  },
+  gemini: { label: "Gemini API", keyHint: "Gemini API key", listModels: gemini.listModels, generate: gemini.generate },
+};
+
+if (import.meta.env.DEV) {
+  const chat: Message[] = [
+    { role: "user", text: "hi", attachments: [{ name: "a.png", mimeType: "image/png", data: "QQ==" }] },
+    { role: "error", text: "boom" },
+    { role: "model", text: "yo" },
+  ];
+  const same = (got: unknown, want: unknown, name: string) =>
+    console.assert(JSON.stringify(got) === JSON.stringify(want), `${name} self-check failed`, got);
+  same(
+    toOpenAIInput(chat),
+    [
+      { role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,QQ==" }, { type: "input_text", text: "hi" }] },
+      { role: "assistant", content: "yo" },
+    ],
+    "toOpenAIInput",
+  );
+  same(
+    toClaudeMessages(chat),
+    [
+      { role: "user", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: "QQ==" } }, { type: "text", text: "hi" }] },
+      { role: "assistant", content: [{ type: "text", text: "yo" }] },
+    ],
+    "toClaudeMessages",
+  );
+  same(toTranscript(chat.slice(0, 1)), "hi", "toTranscript");
+  same(toTranscript(chat).split("\n\n").slice(1), ["User: hi", "Assistant: yo"], "toTranscript");
+}
