@@ -297,7 +297,8 @@ body {
   background-image: none;
 }
 
-.setting :disabled {
+.setting :disabled,
+.attach-button:disabled {
   opacity: 0.4;
   cursor: default;
 }
