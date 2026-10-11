@@ -6,6 +6,8 @@ export type Message = {
   text: string;
   attachments?: Attachment[];
 };
+// "" leaves the level to the provider's default
+export type Effort = "" | "low" | "medium" | "high" | "xhigh" | "max";
 export type Model = {
   name: string; // "models/gemini-..."
   displayName: string;
@@ -62,11 +64,14 @@ if (import.meta.env.DEV) {
   console.assert(JSON.stringify(got) === JSON.stringify(want), "toContents self-check failed", got);
 }
 
-export async function generate(key: string, model: string, messages: Message[]): Promise<string> {
+export async function generate(key: string, model: string, messages: Message[], effort: Effort): Promise<string> {
   // model is the full resource name from listModels ("models/...")
   const body = await call(key, `${model}:generateContent`, {
     method: "POST",
-    body: JSON.stringify({ contents: toContents(messages) }),
+    body: JSON.stringify({
+      contents: toContents(messages),
+      ...(effort && { generationConfig: { thinkingConfig: { thinkingLevel: effort } } }),
+    }),
   });
   const parts: { text?: string }[] | undefined = body?.candidates?.[0]?.content?.parts;
   if (!parts) {

@@ -1,6 +1,8 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
-use tauri::{Manager, PhysicalPosition};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{Emitter, Manager, PhysicalPosition};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 // A non-activating panel takes keyboard input without making this app the active one,
@@ -22,6 +24,13 @@ fn toggle(app: &tauri::AppHandle) -> tauri::Result<()> {
     if window.is_visible()? {
         return window.hide();
     }
+    show(app)
+}
+
+fn show(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
     let monitor = match window.current_monitor()? {
         Some(m) => Some(m),
         None => window.primary_monitor()?,
@@ -183,9 +192,14 @@ fn claude_answer(stream: &str) -> Option<Result<String, String>> {
 fn cli_ask(
     cli: String,
     model: String,
+    effort: String,
     prompt: String,
     images: Vec<Image>,
 ) -> Result<String, String> {
+    // The effort becomes a command-line argument too: only the known levels pass, "" being the CLI's default.
+    if !["", "low", "medium", "high", "xhigh", "max"].contains(&effort.as_str()) {
+        return Err(format!("invalid effort: {effort}"));
+    }
     // The model becomes a command-line argument: keep it to a plain name, never a flag.
     if !model.starts_with(|c: char| c.is_ascii_alphanumeric())
         || !model
@@ -219,6 +233,9 @@ fn cli_ask(
             "--verbose", // stream-json output requires it
         ];
         args.extend(model_args);
+        if !effort.is_empty() {
+            args.extend(["--effort", &effort]);
+        }
         let mut content: Vec<_> = images
             .iter()
             .map(|i| {
@@ -249,6 +266,7 @@ fn cli_ask(
             files.push(path.to_string_lossy().into_owned());
             std::fs::write(&path, bytes).map_err(|e| format!("could not store image: {e}"))?;
         }
+        let effort_config = format!("model_reasoning_effort=\"{effort}\"");
         let mut args = vec![
             "exec",
             "--skip-git-repo-check",
@@ -259,6 +277,9 @@ fn cli_ask(
             "never",
         ];
         args.extend(model_args);
+        if !effort.is_empty() {
+            args.extend(["-c", &effort_config]);
+        }
         // --image takes several values, so each file gets its own flag and they go last
         args.extend(files.iter().flat_map(|f| ["--image", f.as_str()]));
         run_cli(&cli, &args, &prompt)
@@ -267,6 +288,31 @@ fn cli_ask(
         let _ = std::fs::remove_file(file);
     }
     result
+}
+
+// The shortcut that toggles the window; the setting in the webview replaces the default one.
+struct ToggleShortcut(std::sync::Mutex<Shortcut>);
+
+#[tauri::command]
+fn set_shortcut(
+    app: tauri::AppHandle,
+    current: tauri::State<ToggleShortcut>,
+    shortcut: String,
+) -> Result<(), String> {
+    let next: Shortcut = shortcut
+        .parse()
+        .map_err(|e| format!("unusable shortcut {shortcut}: {e}"))?;
+    let mut current = current.0.lock().unwrap();
+    if next == *current {
+        return Ok(());
+    }
+    // New one first, so a failure leaves the old shortcut working.
+    app.global_shortcut()
+        .register(next)
+        .map_err(|e| format!("could not use {shortcut} (held by another app?): {e}"))?;
+    let _ = app.global_shortcut().unregister(*current);
+    *current = next;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -280,18 +326,29 @@ mod tests {
             cli_ask(
                 "claude".into(),
                 "--dangerously-skip-permissions".into(),
+                "".into(),
                 "hi".into(),
                 vec![]
             )
             .is_err()
         );
-        assert!(cli_ask("claude".into(), "a b".into(), "hi".into(), vec![]).is_err());
+        assert!(cli_ask("claude".into(), "a b".into(), "".into(), "hi".into(), vec![]).is_err());
+        assert!(cli_ask("claude".into(), "default".into(), "--x".into(), "hi".into(), vec![]).is_err());
         // an image type is never passed through to a file name or the CLI
         let svg = Image {
             mime_type: "image/svg+xml".into(),
             data: String::new(),
         };
-        assert!(cli_ask("codex".into(), "default".into(), "hi".into(), vec![svg]).is_err());
+        assert!(cli_ask("codex".into(), "default".into(), "".into(), "hi".into(), vec![svg]).is_err());
+    }
+
+    // the strings the settings panel builds from a key press
+    #[test]
+    fn shortcut_setting_parses() {
+        for s in ["Ctrl+Shift+KeyA", "Cmd+Option+Space", "Super+Alt+F5", "Ctrl+Digit1", "Alt+ArrowUp"] {
+            assert!(s.parse::<Shortcut>().is_ok(), "{s}");
+        }
+        assert!("Ctrl+Nope".parse::<Shortcut>().is_err());
     }
 
     #[test]
@@ -317,7 +374,7 @@ mod tests {
         };
         for cli in ["claude", "codex"] {
             let prompt = "What single color fills this image? Answer in one word.";
-            let answer = cli_ask(cli.into(), "default".into(), prompt.into(), vec![red()]).unwrap();
+            let answer = cli_ask(cli.into(), "default".into(), "low".into(), prompt.into(), vec![red()]).unwrap();
             assert!(answer.to_lowercase().contains("red"), "{cli}: {answer}");
         }
         assert!(codex_models().unwrap().contains("\"slug\""));
@@ -331,7 +388,7 @@ pub fn run() {
     let builder = builder.plugin(tauri_nspanel::init());
     builder
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![cli_status, cli_ask, codex_models])
+        .invoke_handler(tauri::generate_handler![cli_status, cli_ask, codex_models, set_shortcut])
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -356,11 +413,34 @@ pub fn run() {
             // Accessory = no Dock icon, no app menu, not in Cmd+Tab.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            // Menu bar item on macOS, notification area on Windows: the only UI besides the shortcut.
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &MenuItem::with_id(app, "settings", "Settings…", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "quit", "Quit Astral", true, None::<&str>)?,
+                ],
+            )?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().ok_or("app icon missing")?.clone())
+                .tooltip("Astral")
+                .menu(&menu)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "settings" => {
+                        if let Err(e) = show(app).and_then(|_| app.emit("open-settings", ())) {
+                            eprintln!("open settings failed: {e}");
+                        }
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
             // Literal Control key, not Command.
             let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyA);
             if let Err(e) = app.global_shortcut().register(shortcut) {
                 eprintln!("could not register Ctrl+Shift+A (held by another app?): {e}");
             }
+            app.manage(ToggleShortcut(std::sync::Mutex::new(shortcut)));
             Ok(())
         })
         .run(tauri::generate_context!())

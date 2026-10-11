@@ -276,6 +276,32 @@ body {
   white-space: nowrap;
 }
 
+/* ---------- settings ---------- */
+
+.setting {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 12px 0 20px;
+}
+
+.setting-divider {
+  margin: 12px 0 0;
+  border: 0;
+  border-top: 1px solid var(--separator);
+}
+
+/* a button with the selects' shape, minus their chevron */
+.shortcut {
+  padding-right: 14px;
+  background-image: none;
+}
+
+.setting :disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* ---------- input row ---------- */
 
 /* 12px padding + 40px controls = 64px, and a 20px control radius is concentric with the 32px window corner */
