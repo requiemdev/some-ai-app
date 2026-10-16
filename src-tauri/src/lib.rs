@@ -28,8 +28,13 @@ fn toggle(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 // Top edge 22% down the screen; a chat tall enough to hang below centre is raised to sit centred instead.
-fn place(window: &tauri::WebviewWindow, height: u32) -> tauri::Result<()> {
-    let monitor = match window.current_monitor()? {
+// `follow_cursor`: on the display under the pointer (when showing), else the one it is on (when resizing).
+fn place(window: &tauri::WebviewWindow, height: u32, follow_cursor: bool) -> tauri::Result<()> {
+    let under_cursor = match follow_cursor {
+        true => window.cursor_position().ok().and_then(|p| window.monitor_from_point(p.x, p.y).ok().flatten()),
+        false => None,
+    };
+    let monitor = match under_cursor.or(window.current_monitor()?) {
         Some(m) => Some(m),
         None => window.primary_monitor()?,
     };
@@ -53,7 +58,7 @@ fn resize(window: tauri::WebviewWindow, height: f64) -> Result<(), String> {
     let physical = (height * window.scale_factor().map_err(|e| e.to_string())?) as u32;
     window
         .set_size(tauri::LogicalSize::new(720.0, height))
-        .and_then(|_| place(&window, physical))
+        .and_then(|_| place(&window, physical, false))
         .map_err(|e| e.to_string())
 }
 
@@ -61,7 +66,7 @@ fn show(app: &tauri::AppHandle) -> tauri::Result<()> {
     let Some(window) = app.get_webview_window("main") else {
         return Ok(());
     };
-    place(&window, window.outer_size()?.height)?;
+    place(&window, window.outer_size()?.height, true)?;
     // set_focus would activate the app, defeating the non-activating panel.
     #[cfg(target_os = "macos")]
     {
@@ -308,12 +313,14 @@ fn cli_ask(
     result
 }
 
-// Two presses of the tap key alone (Command on macOS, Control elsewhere) in quick succession,
+// Two presses of the tap key alone (left Command on macOS, Control elsewhere) in quick succession,
 // with nothing else pressed since the first one (so Cmd+C then Cmd+V does not count).
+// It fires on the second release, so a stray tap followed by Cmd+V does not count either.
 #[derive(Default)]
 struct DoubleTap {
     down: bool,
     first: Option<std::time::Instant>,
+    second: Option<std::time::Instant>,
 }
 
 impl DoubleTap {
@@ -321,21 +328,20 @@ impl DoubleTap {
 
     // `tap`: the tap key is held; `other`: any other key, modifier or mouse button is in play.
     fn step(&mut self, tap: bool, other: bool, now: std::time::Instant) -> bool {
-        let pressed = tap && !other && !self.down;
+        let (pressed, released) = (tap && !self.down, !tap && self.down);
         self.down = tap;
         if other {
-            self.first = None;
-        }
-        if !pressed {
-            return false;
-        }
-        match self.first.take() {
-            Some(first) if now - first < Self::WINDOW => true,
-            _ => {
-                self.first = Some(now);
-                false
+            (self.first, self.second) = (None, None);
+        } else if pressed {
+            match self.first.take() {
+                Some(first) if now - first < Self::WINDOW => self.second = Some(now),
+                _ => self.first = Some(now),
             }
+        } else if released {
+            // a second press held as long as the window is the start of a shortcut, not a tap
+            return self.second.take().is_some_and(|second| now - second < Self::WINDOW);
         }
+        false
     }
 }
 
@@ -349,11 +355,13 @@ fn keys() -> (bool, bool) {
     unsafe extern "C" {
         fn CGEventSourceFlagsState(state: i32) -> u64;
         fn CGEventSourceCounterForEventType(state: i32, event: u32) -> u32;
+        fn CGEventSourceKeyState(state: i32, key: u16) -> bool;
     }
     const SESSION: i32 = 0; // kCGEventSourceStateCombinedSessionState
     const HID: i32 = 1; // kCGEventSourceStateHIDSystemState
     const DOWNS: [u32; 4] = [1, 3, 10, 25]; // left mouse, right mouse, key, other mouse
     const CMD: u64 = 0x10_0000;
+    const LEFT_CMD: u16 = 0x37; // kVK_Command; the flags do not tell the two Command keys apart
     const MODIFIERS: u64 = 0x1E_0000; // shift, control, option, command
     // counted, not sampled: a key tapped between two polls still shows, however late the poll runs
     static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -368,7 +376,9 @@ fn keys() -> (bool, bool) {
         )
     };
     let pressed = SEEN.swap(downs, std::sync::atomic::Ordering::Relaxed) != downs;
-    (mods & CMD != 0, mods != CMD && mods != 0 || pressed)
+    let left = unsafe { CGEventSourceKeyState(SESSION, LEFT_CMD) };
+    // Command held without the left key is the right one: something else
+    (left, mods & !CMD != 0 || (mods != 0 && !left) || pressed)
 }
 
 #[cfg(windows)]
@@ -573,34 +583,52 @@ mod tests {
         use std::time::{Duration, Instant};
         let ms = Duration::from_millis;
         let t = Instant::now();
-        // press, release, press
+        // press, release, press, release: fires on the second release
         let mut tap = DoubleTap::default();
         assert!(!tap.step(true, false, t));
         assert!(!tap.step(false, false, t + ms(80)));
-        assert!(tap.step(true, false, t + ms(200)));
-        // consumed: a third press starts over
-        assert!(!tap.step(false, false, t + ms(260)));
+        assert!(!tap.step(true, false, t + ms(200)));
+        assert!(tap.step(false, false, t + ms(260)));
+        // consumed: a third tap starts over
         assert!(!tap.step(true, false, t + ms(320)));
+        assert!(!tap.step(false, false, t + ms(380)));
         // too slow
         let mut tap = DoubleTap::default();
         assert!(!tap.step(true, false, t));
         assert!(!tap.step(false, false, t + ms(80)));
         assert!(!tap.step(true, false, t + ms(500)));
+        assert!(!tap.step(false, false, t + ms(560)));
         // a key went down while it was held (Cmd+C, Cmd+V)
         let mut tap = DoubleTap::default();
         assert!(!tap.step(true, false, t));
         assert!(!tap.step(true, true, t + ms(40)));
         assert!(!tap.step(false, false, t + ms(80)));
         assert!(!tap.step(true, false, t + ms(200)));
+        assert!(!tap.step(false, false, t + ms(260)));
         // something else in between, or already held at the second press
         let mut tap = DoubleTap::default();
         assert!(!tap.step(true, false, t));
         assert!(!tap.step(false, true, t + ms(80)));
         assert!(!tap.step(true, false, t + ms(200)));
+        assert!(!tap.step(false, false, t + ms(260)));
         let mut tap = DoubleTap::default();
         assert!(!tap.step(true, false, t));
         assert!(!tap.step(false, false, t + ms(80)));
         assert!(!tap.step(true, true, t + ms(200)));
+        assert!(!tap.step(false, false, t + ms(260)));
+        // a stray tap, then Cmd+V: the V arrives while the second press is held
+        let mut tap = DoubleTap::default();
+        assert!(!tap.step(true, false, t));
+        assert!(!tap.step(false, false, t + ms(80)));
+        assert!(!tap.step(true, false, t + ms(200)));
+        assert!(!tap.step(true, true, t + ms(230)));
+        assert!(!tap.step(false, false, t + ms(300)));
+        // second press held too long
+        let mut tap = DoubleTap::default();
+        assert!(!tap.step(true, false, t));
+        assert!(!tap.step(false, false, t + ms(80)));
+        assert!(!tap.step(true, false, t + ms(200)));
+        assert!(!tap.step(false, false, t + ms(700)));
     }
 
     // Needs Screen Recording permission on macOS: cargo test -- --ignored capture
