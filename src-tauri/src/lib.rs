@@ -67,7 +67,19 @@ fn show(app: &tauri::AppHandle) -> tauri::Result<()> {
     {
         use tauri_nspanel::ManagerExt;
         if let Ok(panel) = app.get_webview_panel("main") {
+            // the system fade only plays on the way out: orderFrontRegardless skips it, so the way in is animated here
+            let fade = !window.is_visible()?;
+            if fade {
+                panel.set_alpha_value(0.0);
+            }
             panel.show_and_make_key();
+            if fade {
+                use tauri_nspanel::objc2_app_kit::{NSAnimatablePropertyContainer, NSAnimationContext};
+                NSAnimationContext::beginGrouping();
+                NSAnimationContext::currentContext().setDuration(0.3);
+                panel.as_panel().animator().setAlphaValue(1.0);
+                NSAnimationContext::endGrouping();
+            }
             return Ok(());
         }
     }
@@ -672,6 +684,8 @@ pub fn run() {
                     .ok_or("main window missing")?
                     .to_panel::<Overlay>()?;
                 panel.add_style_mask(StyleMask::empty().nonactivating_panel().into())?;
+                // the system's own quick fade, played on every show and hide
+                panel.as_panel().setAnimationBehavior(tauri_nspanel::objc2_app_kit::NSWindowAnimationBehavior::UtilityWindow);
             }
             // Accessory = no Dock icon, no app menu, not in Cmd+Tab.
             #[cfg(target_os = "macos")]
