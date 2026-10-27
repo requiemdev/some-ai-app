@@ -71,6 +71,8 @@ function App() {
   // the providers are sent the whole chat each time, so dropping the messages is the whole context
   const newChat = () => {
     setMessages([]);
+    setAttachments([]);
+    setInput("");
     setModel((current) => store.get("model") || current);
   };
 
