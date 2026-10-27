@@ -119,7 +119,7 @@ function App() {
     };
   }, [provider]);
 
-  // Double-tapping Command (Ctrl off macOS): Rust took the screenshot and opened the window.
+  // Double-tapping left Command (Ctrl off macOS): Rust took the screenshot and opened the window.
   useEffect(() => {
     if (doubleTap) invoke("set_double_tap", { enabled: false }).catch(showError); // Rust starts with it on
     const unlisten = [
@@ -462,7 +462,7 @@ function App() {
                 </select>
               </label>
               <label className="setting">
-                Double-tap {MAC ? "Command" : "Ctrl"} to attach a screenshot
+                Double-tap {MAC ? "left Command" : "Ctrl"} to attach a screenshot
                 <select
                   className="model-select"
                   value={doubleTap}
